@@ -1,0 +1,13 @@
+# Carpeta de compilació
+target/
+output/
+
+# Fitxers generats
+*.wasm
+*.log
+*.json
+.scenv
+
+# Altres fitxers temporals
+*.old
+*.tmp
