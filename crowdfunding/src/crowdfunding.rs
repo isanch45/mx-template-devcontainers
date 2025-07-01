@@ -25,16 +25,25 @@ pub trait CrowdfundingSc {
             "Deadline can't be in the past"
         );
         self.deadline().set(deadline);
+
+        // Inicialitza el límit a zero (sense límit per defecte)
+        self.max_deposit_per_wallet().set(BigUint::zero());
     }
 
     #[upgrade]
     fn upgrade(&self) {}
 
+    /// Endpoint només per l'owner per establir el límit màxim per billetera
+    #[only_owner]
+    #[endpoint(setMaxDepositPerWallet)]
+    fn set_max_deposit_per_wallet(&self, max: BigUint) {
+        self.max_deposit_per_wallet().set(max);
+    }
+
     #[endpoint]
     #[payable("EGLD")]
     fn fund(&self) {
-        let payment = self.call_value().egld().clone_value();
-
+        let payment = self.call_value().egld_value();
         let current_time = self.blockchain().get_block_timestamp();
         require!(
             current_time < self.deadline().get(),
@@ -43,7 +52,17 @@ pub trait CrowdfundingSc {
 
         let caller = self.blockchain().get_caller();
         let deposited_amount = self.deposit(&caller).get();
-        self.deposit(&caller).set(deposited_amount + payment);
+
+        let max = self.max_deposit_per_wallet().get();
+        // Si el límit està establert (>0), controla que no se superi
+        if max > 0u32 {
+            require!(
+                deposited_amount.clone() + payment.clone_value() <= max,
+                "Deposit exceeds max per wallet"
+            );
+        }
+
+        self.deposit(&caller).set(deposited_amount + payment.clone_value());
     }
 
     #[endpoint]
@@ -108,4 +127,8 @@ pub trait CrowdfundingSc {
     #[view(getDeposit)]
     #[storage_mapper("deposit")]
     fn deposit(&self, donor: &ManagedAddress) -> SingleValueMapper<BigUint>;
+
+    #[view(getMaxDepositPerWallet)]
+    #[storage_mapper("max_deposit_per_wallet")]
+    fn max_deposit_per_wallet(&self) -> SingleValueMapper<BigUint>;
 }
