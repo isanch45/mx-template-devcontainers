@@ -12,7 +12,6 @@ pub enum Status {
     Failed,
 }
 
-/// An empty contract. To be used as a template when starting a new contract from scratch.
 #[multiversx_sc::contract]
 pub trait CrowdfundingSc {
     #[init]
@@ -26,43 +25,73 @@ pub trait CrowdfundingSc {
         );
         self.deadline().set(deadline);
 
-        // Inicialitza el límit a zero (sense límit per defecte)
-        self.max_deposit_per_wallet().set(BigUint::zero());
+        self.max_total_per_wallet().set(BigUint::zero());
+        self.min_deposit_per_tx().set(BigUint::zero());
+        self.max_total_project().set(BigUint::zero());
     }
 
     #[upgrade]
     fn upgrade(&self) {}
 
-    /// Endpoint només per l'owner per establir el límit màxim per billetera
     #[only_owner]
-    #[endpoint(setMaxDepositPerWallet)]
-    fn set_max_deposit_per_wallet(&self, max: BigUint) {
-        self.max_deposit_per_wallet().set(max);
+    #[endpoint(setMaxTotalPerWallet)]
+    fn set_max_total_per_wallet(&self, max: BigUint) {
+        self.max_total_per_wallet().set(max);
+    }
+
+    #[only_owner]
+    #[endpoint(setMinDepositPerTx)]
+    fn set_min_deposit_per_tx(&self, min: BigUint) {
+        self.min_deposit_per_tx().set(min);
+    }
+
+    #[only_owner]
+    #[endpoint(setMaxTotalProject)]
+    fn set_max_total_project(&self, max: BigUint) {
+        self.max_total_project().set(max);
     }
 
     #[endpoint]
     #[payable("EGLD")]
     fn fund(&self) {
-        let payment = self.call_value().egld_value();
+        let payment = self.call_value().egld_value(); // ManagedRef<BigUint>
+        let amount = payment.clone_value(); // Convertim a BigUint
         let current_time = self.blockchain().get_block_timestamp();
+
         require!(
             current_time < self.deadline().get(),
             "cannot fund after deadline"
         );
 
-        let caller = self.blockchain().get_caller();
-        let deposited_amount = self.deposit(&caller).get();
-
-        let max = self.max_deposit_per_wallet().get();
-        // Si el límit està establert (>0), controla que no se superi
-        if max > 0u32 {
+        let min = self.min_deposit_per_tx().get();
+        if min > 0u32 {
             require!(
-                deposited_amount.clone() + payment.clone_value() <= max,
-                "Deposit exceeds max per wallet"
+                amount >= min.clone(),
+                "Deposit is below minimum per transaction"
             );
         }
 
-        self.deposit(&caller).set(deposited_amount + payment.clone_value());
+        let caller = self.blockchain().get_caller();
+        let deposited_amount = self.deposit(&caller).get();
+
+        let max_wallet = self.max_total_per_wallet().get();
+        if max_wallet > 0u32 {
+            require!(
+                deposited_amount.clone() + amount.clone() <= max_wallet.clone(),
+                "Deposit exceeds max total per wallet"
+            );
+        }
+
+        let current_total = self.get_current_funds();
+        let max_project = self.max_total_project().get();
+        if max_project > 0u32 {
+            require!(
+                current_total + amount.clone() <= max_project.clone(),
+                "Deposit exceeds project total cap"
+            );
+        }
+
+        self.deposit(&caller).set(deposited_amount + amount);
     }
 
     #[endpoint]
@@ -108,8 +137,6 @@ pub trait CrowdfundingSc {
             .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0)
     }
 
-    // private
-
     fn get_current_time(&self) -> u64 {
         self.blockchain().get_block_timestamp()
     }
@@ -128,7 +155,15 @@ pub trait CrowdfundingSc {
     #[storage_mapper("deposit")]
     fn deposit(&self, donor: &ManagedAddress) -> SingleValueMapper<BigUint>;
 
-    #[view(getMaxDepositPerWallet)]
-    #[storage_mapper("max_deposit_per_wallet")]
-    fn max_deposit_per_wallet(&self) -> SingleValueMapper<BigUint>;
+    #[view(getMaxTotalPerWallet)]
+    #[storage_mapper("max_total_per_wallet")]
+    fn max_total_per_wallet(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getMinDepositPerTx)]
+    #[storage_mapper("min_deposit_per_tx")]
+    fn min_deposit_per_tx(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getMaxTotalProject)]
+    #[storage_mapper("max_total_project")]
+    fn max_total_project(&self) -> SingleValueMapper<BigUint>;
 }
