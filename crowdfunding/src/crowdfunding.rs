@@ -1,169 +1,145 @@
 #![no_std]
 
-use multiversx_sc::derive_imports::*;
-#[allow(unused_imports)]
-use multiversx_sc::imports::*;
-
-#[type_abi]
-#[derive(TopEncode, TopDecode, PartialEq, Clone, Copy)]
-pub enum Status {
-    FundingPeriod,
-    Successful,
-    Failed,
-}
+multiversx_sc::imports!();
+multiversx_sc::derive_imports!();
 
 #[multiversx_sc::contract]
-pub trait CrowdfundingSc {
+pub trait CrowdfundingContract {
     #[init]
-    fn init(&self, target: BigUint, deadline: u64) {
-        require!(target > 0, "Target must be more than 0");
-        self.target().set(target);
-
-        require!(
-            deadline > self.get_current_time(),
-            "Deadline can't be in the past"
-        );
-        self.deadline().set(deadline);
-
-        self.max_total_per_wallet().set(BigUint::zero());
-        self.min_deposit_per_tx().set(BigUint::zero());
-        self.max_total_project().set(BigUint::zero());
+    fn init(
+        &self,
+        target: BigUint,
+        deadline: u64,
+        min_deposit: BigUint,
+        max_per_wallet: BigUint,
+        admin2: ManagedAddress,
+    ) {
+        require!(!target.is_zero(), "Target cannot be zero");
+        self.target().set(&target);
+        self.max_total().set(&(target.clone() + target.clone() / 10u32));
+        self.deadline().set(&deadline);
+        self.min_deposit().set(&min_deposit);
+        self.max_per_wallet().set(&max_per_wallet);
+        self.admin1().set(&self.blockchain().get_caller());
+        self.admin2().set(&admin2);
+        self.total_funds().set(BigUint::zero());
+        self.terminated().set(false);
     }
 
-    #[upgrade]
-    fn upgrade(&self) {}
-
-    #[only_owner]
-    #[endpoint(setMaxTotalPerWallet)]
-    fn set_max_total_per_wallet(&self, max: BigUint) {
-        self.max_total_per_wallet().set(max);
-    }
-
-    #[only_owner]
-    #[endpoint(setMinDepositPerTx)]
-    fn set_min_deposit_per_tx(&self, min: BigUint) {
-        self.min_deposit_per_tx().set(min);
-    }
-
-    #[only_owner]
-    #[endpoint(setMaxTotalProject)]
-    fn set_max_total_project(&self, max: BigUint) {
-        self.max_total_project().set(max);
-    }
-
-    #[endpoint]
     #[payable("EGLD")]
+    #[endpoint]
     fn fund(&self) {
-        let payment = self.call_value().egld_value(); // ManagedRef<BigUint>
-        let amount = payment.clone_value(); // Convertim a BigUint
-        let current_time = self.blockchain().get_block_timestamp();
-
-        require!(
-            current_time < self.deadline().get(),
-            "cannot fund after deadline"
-        );
-
-        let min = self.min_deposit_per_tx().get();
-        if min > 0u32 {
-            require!(
-                amount >= min.clone(),
-                "Deposit is below minimum per transaction"
-            );
-        }
-
         let caller = self.blockchain().get_caller();
-        let deposited_amount = self.deposit(&caller).get();
+        let value = self.call_value().egld_value();
+        let now = self.blockchain().get_block_timestamp();
 
-        let max_wallet = self.max_total_per_wallet().get();
-        if max_wallet > 0u32 {
-            require!(
-                deposited_amount.clone() + amount.clone() <= max_wallet.clone(),
-                "Deposit exceeds max total per wallet"
-            );
-        }
+        require!(now <= self.deadline().get(), "Deadline passed");
+        require!(value >= self.min_deposit().get(), "Below minimum deposit");
 
-        let current_total = self.get_current_funds();
-        let max_project = self.max_total_project().get();
-        if max_project > 0u32 {
-            require!(
-                current_total + amount.clone() <= max_project.clone(),
-                "Deposit exceeds project total cap"
-            );
-        }
+        let user_total = self.user_deposits(&caller).get() + value.clone();
+        require!(user_total <= self.max_per_wallet().get(), "Above max per wallet");
 
-        self.deposit(&caller).set(deposited_amount + amount);
+        let new_total = self.total_funds().get() + value.clone();
+        require!(new_total <= self.max_total().get(), "Above total max");
+
+        self.user_deposits(&caller).set(&user_total);
+        self.total_funds().set(&new_total);
     }
 
     #[endpoint]
-    fn claim(&self) {
-        match self.status() {
-            Status::FundingPeriod => sc_panic!("cannot claim before deadline"),
-            Status::Successful => {
-                let caller = self.blockchain().get_caller();
-                require!(
-                    caller == self.blockchain().get_owner_address(),
-                    "only owner can claim successful funding"
-                );
+    fn claimFunds(&self) {
+        let caller = self.blockchain().get_caller();
+        require!(self.is_admin(&caller), "Not admin");
+        require!(!self.terminated().get(), "Campaign terminated");
 
-                let sc_balance = self.get_current_funds();
-                self.send().direct_egld(&caller, &sc_balance);
-            }
-            Status::Failed => {
-                let caller = self.blockchain().get_caller();
-                let deposit = self.deposit(&caller).get();
+        let total = self.total_funds().get();
+        require!(total >= self.target().get(), "Target not reached");
 
-                if deposit > 0u32 {
-                    self.deposit(&caller).clear();
-                    self.send().direct_egld(&caller, &deposit);
-                }
-            }
-        }
+        self.send().direct_egld(&caller, &total);
+        self.total_funds().set(BigUint::zero());
     }
 
-    #[view]
-    fn status(&self) -> Status {
-        if self.get_current_time() <= self.deadline().get() {
-            Status::FundingPeriod
-        } else if self.get_current_funds() >= self.target().get() {
-            Status::Successful
-        } else {
-            Status::Failed
-        }
+    #[endpoint]
+    fn claimRefund(&self) {
+        let caller = self.blockchain().get_caller();
+        let now = self.blockchain().get_block_timestamp();
+
+        let should_refund = now > self.deadline().get() || self.terminated().get();
+        require!(should_refund, "Refund not allowed");
+
+        let deposit = self.user_deposits(&caller).get();
+        require!(!deposit.is_zero(), "No funds to refund");
+
+        self.send().direct_egld(&caller, &deposit);
+        self.user_deposits(&caller).clear();
     }
 
-    #[view(getCurrentFunds)]
-    fn get_current_funds(&self) -> BigUint {
-        self.blockchain()
-            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0)
+    #[endpoint]
+    fn terminateCampaign(&self) {
+        let caller = self.blockchain().get_caller();
+        require!(self.is_admin(&caller), "Not admin");
+        self.terminated().set(true);
     }
 
-    fn get_current_time(&self) -> u64 {
-        self.blockchain().get_block_timestamp()
+    #[endpoint]
+    fn uploadInvoiceHash(&self, hash: ManagedBuffer) {
+        let caller = self.blockchain().get_caller();
+        require!(self.is_admin(&caller), "Not admin");
+        self.invoice_hash().set(&hash);
+        self.invoice_event(&caller, &hash);
     }
 
-    // storage
+    #[view(getContractAddress)]
+    fn get_contract_address(&self) -> ManagedAddress {
+        self.blockchain().get_sc_address()
+    }
 
-    #[view(getTarget)]
+    #[endpoint]
+    fn upgradeParams(&self, new_min: BigUint, new_max: BigUint) {
+        let caller = self.blockchain().get_caller();
+        require!(self.is_admin(&caller), "Not admin");
+        self.min_deposit().set(&new_min);
+        self.max_per_wallet().set(&new_max);
+    }
+
+    #[view(isAdmin)]
+    fn is_admin(&self, addr: &ManagedAddress) -> bool {
+        addr == &self.admin1().get() || addr == &self.admin2().get()
+    }
+
     #[storage_mapper("target")]
     fn target(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getDeadline)]
+    #[storage_mapper("max_total")]
+    fn max_total(&self) -> SingleValueMapper<BigUint>;
+
     #[storage_mapper("deadline")]
     fn deadline(&self) -> SingleValueMapper<u64>;
 
-    #[view(getDeposit)]
-    #[storage_mapper("deposit")]
-    fn deposit(&self, donor: &ManagedAddress) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("min_deposit")]
+    fn min_deposit(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getMaxTotalPerWallet)]
-    #[storage_mapper("max_total_per_wallet")]
-    fn max_total_per_wallet(&self) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("max_per_wallet")]
+    fn max_per_wallet(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getMinDepositPerTx)]
-    #[storage_mapper("min_deposit_per_tx")]
-    fn min_deposit_per_tx(&self) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("total_funds")]
+    fn total_funds(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getMaxTotalProject)]
-    #[storage_mapper("max_total_project")]
-    fn max_total_project(&self) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("admin1")]
+    fn admin1(&self) -> SingleValueMapper<ManagedAddress>;
+
+    #[storage_mapper("admin2")]
+    fn admin2(&self) -> SingleValueMapper<ManagedAddress>;
+
+    #[storage_mapper("terminated")]
+    fn terminated(&self) -> SingleValueMapper<bool>;
+
+    #[storage_mapper("invoice_hash")]
+    fn invoice_hash(&self) -> SingleValueMapper<ManagedBuffer>;
+
+    #[storage_mapper("user_deposits")]
+    fn user_deposits(&self, user: &ManagedAddress) -> SingleValueMapper<BigUint>;
+
+    #[event("invoice_uploaded")]
+    fn invoice_event(&self, #[indexed] admin: &ManagedAddress, hash: &ManagedBuffer);
 }
